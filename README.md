@@ -1,14 +1,14 @@
 ---
 title: ImageStitcherByOpenCV
-emoji: 🐠
-colorFrom: gray
-colorTo: gray
+emoji: 🖼️
+colorFrom: purple
+colorTo: yellow
 sdk: gradio
-sdk_version: 5.25.2
+sdk_version: 5.27.0
 app_file: app.py
-pinned: false
+pinned: true
 license: mit
-short_description: OpenCV Image Stitcher
+short_description: OpenCV Image Stitcher (SCANS, PANORAMA, DIRECT_PAIRWISE)
 ---
 
 Check out the configuration reference at https://huggingface.co/docs/hub/spaces-config-reference
