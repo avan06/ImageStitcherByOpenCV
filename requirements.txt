@@ -1,2 +1,2 @@
-gradio==5.27.0
+gradio==5.50.0
 opencv-contrib-python
