@@ -1489,6 +1489,7 @@ def stitch_pairwise_images(img_composite, img_new,
 
 # --- Function for N-Image Stitching (Primarily for Image List Input) ---
 def stitch_multiple_images(images, # List of NumPy images (BGR/BGRA, potentially pre-cropped)
+                                    use_transparency=True,
                                     stitcher_mode_str="SCANS",
                                     registration_resol=0.6,
                                     seam_estimation_resol=0.1,
@@ -1509,14 +1510,15 @@ def stitch_multiple_images(images, # List of NumPy images (BGR/BGRA, potentially
                                     max_blending_height=10000,
                                     blend_smooth_ksize=15,
                                     num_blend_levels=4,
-                                    fixed_base_image_index=-1
+                                    fixed_base_image_index=-1,
                                     ):
     """
     Stitches a list of images. Tries cv2.Stitcher first (unless 'DIRECT_PAIRWISE'),
     otherwise falls back to manual pairwise stitching.
     Returns ONE stitched image (RGB/RGBA) and log.
-    Input images should be in BGR format (already potentially cropped by caller).
+    Input images should be in BGR or BGRA format (already potentially cropped by caller).
     Output is RGBA. The 'enable_cropping' param here refers to final black border cropping.
+    If use_transparency is False, the final output will be RGB (opaque background).
     """
     log = log_and_print(f"--- Starting Stitching Process for {len(images)} Provided Images ---\n", "")
     total_start_time = time.time()
@@ -1796,7 +1798,8 @@ def stitch_multiple_images(images, # List of NumPy images (BGR/BGRA, potentially
 
     # Clean up the input image list now that it's processed
     del images
-    if 'valid_images' in locals(): del valid_images # Should be same as images now
+    if 'valid_images' in locals():
+        del valid_images # Should be same as images now
     gc.collect()
 
     # 3. Final Result Check and Return (Handling Alpha Channel)
@@ -1806,15 +1809,26 @@ def stitch_multiple_images(images, # List of NumPy images (BGR/BGRA, potentially
     if stitched_img_bgra is not None and stitched_img_bgra.size > 0:
         log = log_and_print("Stitching process finished for image list.", log)
         try:
-            # Check channel count to preserve transparency
-            if stitched_img_bgra.shape[2] == 4:
+            # Handle final output based on transparency flag
+            if use_transparency:
+                # Preserve/Ensure RGBA
+                if stitched_img_bgra.shape[2] == 4:
                 # Convert BGRA to RGBA
-                stitched_img_rgba = cv2.cvtColor(stitched_img_bgra, cv2.COLOR_BGRA2RGBA)
-                log = log_and_print("Converted BGRA to RGBA (Transparency preserved).", log)
+                    stitched_img_rgba = cv2.cvtColor(stitched_img_bgra, cv2.COLOR_BGRA2RGBA)
+                    log = log_and_print("Converted BGRA to RGBA (Transparency preserved).", log)
+                else:
+                    # Source was BGR, make it RGBA (solid alpha)
+                    stitched_img_rgba = cv2.cvtColor(stitched_img_bgra, cv2.COLOR_BGR2RGBA)
+                    log = log_and_print("Converted BGR to RGBA.", log)
             else:
-                # Convert BGR to RGB
-                stitched_img_rgba = cv2.cvtColor(stitched_img_bgra, cv2.COLOR_BGR2RGB)
-                log = log_and_print("Converted BGR to RGB.", log)
+                # Force RGB (Drop Alpha / Opaque)
+                if stitched_img_bgra.shape[2] == 4:
+                    stitched_img_rgba = cv2.cvtColor(stitched_img_bgra, cv2.COLOR_BGRA2RGB)
+                    log = log_and_print("Converted BGRA to RGB (Transparency disabled, alpha dropped).", log)
+                else:
+                    # Convert BGR to RGB
+                    stitched_img_rgba = cv2.cvtColor(stitched_img_bgra, cv2.COLOR_BGR2RGB)
+                    log = log_and_print("Converted BGR to RGB.", log)
                 
             del stitched_img_bgra # Release BGRA version
             gc.collect()
@@ -1834,6 +1848,7 @@ def stitch_multiple_images(images, # List of NumPy images (BGR/BGRA, potentially
 
 # --- Video Frame Stitching ---
 def stitch_video_frames(video_path,
+                        use_transparency=True,
                         crop_top_percent=0.0,
                         crop_bottom_percent=0.0,
                         enable_cropping=True, # This is for POST-stitch cropping
@@ -1854,10 +1869,11 @@ def stitch_video_frames(video_path,
                         sample_interval_ms=3000,
                         max_composite_width=10000,
                         max_composite_height=10000,
-                        progress=None):
+                        progress=None,
+                        ):
     """
     Reads a video, samples frames, and stitches them sequentially.
-    Returns a list of stitched images (RGBA/RGB) and a log.
+    Returns a list of stitched images (RGBA if transparency=True, else RGB) and a log.
     """
     log = log_and_print(f"--- Starting Incremental Video Stitching: {os.path.basename(video_path)} ---\n", "")
     log = log_and_print(f"Params: Interval={sample_interval_ms}ms, Transform={transform_model_str}, ORB={orb_nfeatures}, Ratio={match_ratio_thresh}\n", log)
@@ -1867,7 +1883,7 @@ def stitch_video_frames(video_path,
     log = log_and_print(f"Post-Crop Black Borders: {enable_cropping}, Strict Edges: {strict_no_black_edges}\n", log)
     log = log_and_print(f"Blending: Method={blend_method}, GainComp={enable_gain_compensation}, SmoothKSize={blend_smooth_ksize}, MB Levels={num_blend_levels}\n", log)
     total_start_time = time.time()
-    stitched_results_rgba = [] # Store final RGBA images
+    stitched_results_rgba = [] # Store final images (RGBA or RGB)
 
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -1900,10 +1916,17 @@ def stitch_video_frames(video_path,
     # Helper to save image to results list with correct color conversion
     def append_result(img_bgr_or_bgra):
         try:
-            if img_bgr_or_bgra.shape[2] == 4:
-                stitched_results_rgba.append(cv2.cvtColor(img_bgr_or_bgra, cv2.COLOR_BGRA2RGBA))
+            if use_transparency:
+                if img_bgr_or_bgra.shape[2] == 4:
+                    stitched_results_rgba.append(cv2.cvtColor(img_bgr_or_bgra, cv2.COLOR_BGRA2RGBA))
+                else:
+                    stitched_results_rgba.append(cv2.cvtColor(img_bgr_or_bgra, cv2.COLOR_BGR2RGBA))
             else:
-                stitched_results_rgba.append(cv2.cvtColor(img_bgr_or_bgra, cv2.COLOR_BGR2RGB))
+                # Force RGB Output
+                if img_bgr_or_bgra.shape[2] == 4:
+                     stitched_results_rgba.append(cv2.cvtColor(img_bgr_or_bgra, cv2.COLOR_BGRA2RGB))
+                else:
+                     stitched_results_rgba.append(cv2.cvtColor(img_bgr_or_bgra, cv2.COLOR_BGR2RGB))
             return True
         except Exception as e:
             print(f"Error converting result: {e}")
@@ -1925,25 +1948,41 @@ def stitch_video_frames(video_path,
                 if frame_bgr_raw is not None and frame_bgr_raw.size > 0:
                     processed_sampled_count += 1
                     frame_bgra = None # Initialize BGR frame variable
-                
-                    # Ensure BGRA for processing
-                    if frame_bgr_raw.ndim == 2:
-                        frame_bgra = cv2.cvtColor(frame_bgr_raw, cv2.COLOR_GRAY2BGRA)
-                    elif frame_bgr_raw.ndim == 3 and frame_bgr_raw.shape[2] == 3:
-                        # Add alpha channel (opaque)
-                        frame_bgra = cv2.cvtColor(frame_bgr_raw, cv2.COLOR_BGR2BGRA)
-                    elif frame_bgr_raw.ndim == 3 and frame_bgr_raw.shape[2] == 4:
-                        frame_bgra = frame_bgr_raw
+
+                    # Handle Transparency Input
+                    if not use_transparency:
+                        # If transparency is disabled, ensure we treat the input as Opaque BGRA
+                        # We must use BGRA for the internal stitcher to work (warping masks), 
+                        # but we ensure the Alpha channel is full (255).
+                        if frame_bgr_raw.ndim == 3 and frame_bgr_raw.shape[2] == 3:
+                            frame_bgra = cv2.cvtColor(frame_bgr_raw, cv2.COLOR_BGR2BGRA)
+                        elif frame_bgr_raw.ndim == 3 and frame_bgr_raw.shape[2] == 4:
+                             # Drop existing alpha and replace with opaque
+                             temp_bgr = cv2.cvtColor(frame_bgr_raw, cv2.COLOR_BGRA2BGR)
+                             frame_bgra = cv2.cvtColor(temp_bgr, cv2.COLOR_BGR2BGRA)
+                             del temp_bgr
+                        else:
+                             # Grayscale
+                             frame_bgra = cv2.cvtColor(frame_bgr_raw, cv2.COLOR_GRAY2BGRA)
                     else:
-                        log = log_and_print(f"Warning: Skipping frame {frame_num} due to unexpected shape {frame_bgr_raw.shape}\n", log)
-                        if frame_bgr_raw is not None:
-                            del frame_bgr_raw # Clean up original frame
-                        gc.collect()
-                        frame_num += 1
-                        continue # Skip to next frame read
+                        # Standard Transparency Handling
+                        if frame_bgr_raw.ndim == 2:
+                            frame_bgra = cv2.cvtColor(frame_bgr_raw, cv2.COLOR_GRAY2BGRA)
+                        elif frame_bgr_raw.ndim == 3 and frame_bgr_raw.shape[2] == 3:
+                            # Add alpha channel (opaque)
+                            frame_bgra = cv2.cvtColor(frame_bgr_raw, cv2.COLOR_BGR2BGRA)
+                        elif frame_bgr_raw.ndim == 3 and frame_bgr_raw.shape[2] == 4:
+                            frame_bgra = frame_bgr_raw
+                        else:
+                            log = log_and_print(f"Warning: Skipping frame {frame_num} due to unexpected shape {frame_bgr_raw.shape}\n", log)
+                            if frame_bgr_raw is not None:
+                                del frame_bgr_raw # Clean up original frame
+                            gc.collect()
+                            frame_num += 1
+                            continue # Skip to next frame read
                     
                     # Release the raw frame once converted/checked (if a copy was made)
-                    if frame_bgra is not frame_bgr_raw:
+                    if frame_bgra is not frame_bgr_raw and frame_bgr_raw is not None:
                         del frame_bgr_raw
                         frame_bgr_raw = None # Mark as deleted
                         gc.collect()
@@ -2246,6 +2285,7 @@ def stitch_video_frames(video_path,
 
 # --- Gradio Interface Function ---
 def run_stitching_interface(input_files,
+    use_transparency,
     crop_top_percent,
     crop_bottom_percent,
     stitcher_mode_str, # For cv2.Stitcher
@@ -2413,6 +2453,7 @@ def run_stitching_interface(input_files,
 
         final_stitched_images_rgba, stitch_log = stitch_video_frames(
             video_path,
+            use_transparency=use_transparency,
             crop_top_percent=crop_top_percent,
             crop_bottom_percent=crop_bottom_percent,
             enable_cropping=enable_cropping, # Post-stitch crop
@@ -2445,11 +2486,16 @@ def run_stitching_interface(input_files,
             try:
                 n = np.fromfile(img_path, np.uint8)
                 if n.size > 0:
+                    # Load logic based on transparency flag
+                    if use_transparency:
                         # Use IMREAD_UNCHANGED to keep Alpha
                         img = cv2.imdecode(n, cv2.IMREAD_UNCHANGED)
+                    else:
+                        img = cv2.imdecode(n, cv2.IMREAD_COLOR) # Ignore alpha
                 else:
-                        log = log_and_print(f"Error: File is empty: {os.path.basename(img_path)}. Skipping.\n", log)
-                        continue
+                    log = log_and_print(f"Error: File is empty: {os.path.basename(img_path)}. Skipping.\n", log)
+                    continue
+
                 if img is None:
                          raise ValueError("imdecode returned None")
             except Exception as e_read:
@@ -2458,22 +2504,36 @@ def run_stitching_interface(input_files,
                     del img
                 continue # Skip to the next image
 
-            # Convert to BGRA for consistency
+            # Convert to BGRA for internal processing consistency
+            # (Internal stitching needs masks, so we use BGRA format even if opaque)
             img_bgra = None
             try:
-                if img.ndim == 2:
-                    img_bgra = cv2.cvtColor(img, cv2.COLOR_GRAY2BGRA)
-                elif img.ndim == 3 and img.shape[2] == 3:
-                    img_bgra = cv2.cvtColor(img, cv2.COLOR_BGR2BGRA)
-                elif img.ndim == 3 and img.shape[2] == 4:
-                    img_bgra = img # Already BGRA
+                if use_transparency:
+                    if img.ndim == 2:
+                        img_bgra = cv2.cvtColor(img, cv2.COLOR_GRAY2BGRA)
+                    elif img.ndim == 3 and img.shape[2] == 3:
+                        img_bgra = cv2.cvtColor(img, cv2.COLOR_BGR2BGRA)
+                    elif img.ndim == 3 and img.shape[2] == 4:
+                        img_bgra = img # Already BGRA
+                    else:
+                        log = log_and_print(f"Error: Invalid image shape {img.shape} for {os.path.basename(img_path)}. Skipping.\n", log)
+                        del img
+                        if 'img_bgra' in locals() and img_bgra is not None:
+                            del img_bgra
+                        gc.collect()
+                        continue # Skip to the next image
                 else:
-                    log = log_and_print(f"Error: Invalid image shape {img.shape} for {os.path.basename(img_path)}. Skipping.\n", log)
-                    del img
-                    if 'img_bgra' in locals() and img_bgra is not None:
-                        del img_bgra
-                    gc.collect()
-                    continue # Skip to the next image
+                    # Force Opaque BGRA
+                    if img.ndim == 2:
+                        img_bgra = cv2.cvtColor(img, cv2.COLOR_GRAY2BGRA)
+                    elif img.ndim == 3 and img.shape[2] == 3:
+                        img_bgra = cv2.cvtColor(img, cv2.COLOR_BGR2BGRA)
+                    elif img.ndim == 3 and img.shape[2] == 4: 
+                         # Drop alpha, re-add opaque
+                         tmp = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+                         img_bgra = cv2.cvtColor(tmp, cv2.COLOR_BGR2BGRA)
+                         del tmp
+
             except cv2.error as e_cvt_color:
                 log = log_and_print(f"Error converting image color for {os.path.basename(img_path)}: {e_cvt_color}. Skipping.\n", log)
                 del img
@@ -2516,7 +2576,8 @@ def run_stitching_interface(input_files,
 
             # Call the modified stitch_multiple_images function
         stitched_single_rgba, stitch_log_img = stitch_multiple_images(
-            images_bgr_cropped, # Pass the list of cropped images (BGRA)
+            images_bgr_cropped, # Pass the list of cropped images (BGRA/BGR)
+            use_transparency=use_transparency,
             stitcher_mode_str=stitcher_mode_str,
             registration_resol=registration_resol,
             seam_estimation_resol=seam_estimation_resol,
@@ -2618,12 +2679,19 @@ def run_stitching_interface(input_files,
                 full_path = os.path.join(temp_dir, filename)
                 img_bgra = None # Initialize for finally block
                 try:
-                    # Handle RGBA to BGRA for saving
-                    # The result coming from stitcher is in RGB(A) format
-                    if img_rgba.shape[2] == 4:
-                        img_bgra = cv2.cvtColor(img_rgba, cv2.COLOR_RGBA2BGRA)
+                    if use_transparency:
+                        # Handle RGBA to BGRA for saving
+                        # The result coming from stitcher is in RGB(A) format
+                        if img_rgba.shape[2] == 4:
+                            img_bgra = cv2.cvtColor(img_rgba, cv2.COLOR_RGBA2BGRA)
+                        else:
+                            img_bgra = cv2.cvtColor(img_rgba, cv2.COLOR_RGB2BGR)
                     else:
-                        img_bgra = cv2.cvtColor(img_rgba, cv2.COLOR_RGB2BGR)
+                        # Transparency Disabled: Output should be RGB (saved as BGR)
+                        if img_rgba.shape[2] == 4:
+                            img_bgra = cv2.cvtColor(img_rgba, cv2.COLOR_RGBA2BGR) # Drop Alpha
+                        else:
+                            img_bgra = cv2.cvtColor(img_rgba, cv2.COLOR_RGB2BGR)
                 
                     # Use imencode -> write pattern for better handling of paths/special chars
                     is_success, buf = cv2.imencode('.png', img_bgra)
@@ -2685,6 +2753,8 @@ with gr.Blocks() as demo:
 
             # --- Parameters Grouping ---
             with gr.Accordion("Preprocessing Settings", open=True):
+                use_transparency = gr.Checkbox(value=True, label="Use Transparency", 
+                    info="If Checked: Preserves alpha channel (RGBA). Unchecked: Treats images as opaque and outputs RGB (Black background for warped areas).")
                 crop_top_percent = gr.Slider(0.0, 49.0, step=0.5, value=0.0, label="Crop Top %",
                                                                          info="Percentage of height to remove from the TOP of each image/frame BEFORE stitching.")
                 crop_bottom_percent = gr.Slider(0.0, 49.0, step=0.5, value=0.0, label="Crop Bottom %",
@@ -2762,6 +2832,7 @@ with gr.Blocks() as demo:
         inputs=[
                 input_files,
                 # Preprocessing
+                use_transparency,
                 crop_top_percent,
                 crop_bottom_percent,
                 # OpenCV Stitcher (Image List)
@@ -2797,7 +2868,7 @@ with gr.Blocks() as demo:
         examples = [
         [
             ["examples/Wetter-Panorama/Wetter-Panorama1[NIuO6hrFTrg].mp4"],
-            0, 20,
+            True, 0, 20,
             "DIRECT_PAIRWISE", 0.6, 0.1, -1, False, "GAIN_BLOCKS",
             True, False, -1,
             "Homography", "Multi-Band", True, 5000, 0.5, 5.0, 0.5, 10000, 10000, 15, 4,
@@ -2805,7 +2876,7 @@ with gr.Blocks() as demo:
         ],
         [
             ["examples/Wetter-Panorama/Wetter-Panorama2[NIuO6hrFTrg].mp4"],
-            0, 20,
+            True, 0, 20,
             "DIRECT_PAIRWISE", 0.6, 0.1, -1, False, "GAIN_BLOCKS",
             True, False, -1,
             "Homography", "Multi-Band", True, 5000, 0.5, 5.0, 0.5, 10000, 10000, 15, 4,
@@ -2814,7 +2885,7 @@ with gr.Blocks() as demo:
         [
             ["examples/NieRAutomata/nier2B_01.jpg", "examples/NieRAutomata/nier2B_02.jpg", "examples/NieRAutomata/nier2B_03.jpg", "examples/NieRAutomata/nier2B_04.jpg", "examples/NieRAutomata/nier2B_05.jpg",
              "examples/NieRAutomata/nier2B_06.jpg", "examples/NieRAutomata/nier2B_07.jpg", "examples/NieRAutomata/nier2B_08.jpg", "examples/NieRAutomata/nier2B_09.jpg", "examples/NieRAutomata/nier2B_10.jpg", ],
-            0, 0,
+            True, 0, 0,
             "PANORAMA", 0.6, 0.1, -1, False, "GAIN_BLOCKS",
             True, False, -1,
             "Homography", "Multi-Band", True, 5000, 0.5, 5.0, 0.5, 10000, 10000, 15, 4,
@@ -2822,7 +2893,7 @@ with gr.Blocks() as demo:
         ],
         [
             ["examples/cat/cat_left.jpg", "examples/cat/cat_right.jpg"],
-            0, 0,
+            True, 0, 0,
             "SCANS", 0.6, 0.1, -1, False, "GAIN_BLOCKS",
             True, False, -1,
             "Affine_Partial", "Linear", True, 5000, 0.5, 5.0, 0.5, 10000, 10000, 15, 4,
@@ -2830,7 +2901,7 @@ with gr.Blocks() as demo:
         ],
         [
             ["examples/ギルドの受付嬢ですが/Girumasu_1.jpg", "examples/ギルドの受付嬢ですが/Girumasu_2.jpg", "examples/ギルドの受付嬢ですが/Girumasu_3.jpg"],
-            0, 0,
+            True, 0, 0,
             "PANORAMA", 0.6, 0.1, -1, False, "GAIN_BLOCKS",
             True, False, -1,
             "Affine_Partial", "Linear", True, 5000, 0.65, 5.0, 0.5, 10000, 10000, 15, 4,
@@ -2838,7 +2909,7 @@ with gr.Blocks() as demo:
         ],
         [
             ["examples/photographs1/img1.jpg", "examples/photographs1/img2.jpg", "examples/photographs1/img3.jpg", "examples/photographs1/img4.jpg"],
-            0, 0,
+            True, 0, 0,
             "PANORAMA", 0.6, 0.1, -1, True, "GAIN_BLOCKS",
             True, False, -1,
             "Homography", "Linear", True, 5000, 0.5, 5.0, 0.5, 10000, 10000, 15, 4,
