@@ -518,7 +518,8 @@ def stitch_pairwise_images(img_composite, img_new,
                                                          max_blending_width=10000,
                                                          max_blending_height=10000,
                                                          blend_smooth_ksize=15,
-                                                         num_blend_levels=4
+                                                         num_blend_levels=4,
+                                                         fixed_layer_type="none" # _type: "none", "img1", "img2"
                                                         ):
     """
     Stitches a new image (img_new) onto an existing composite image (img_composite)
@@ -879,14 +880,14 @@ def stitch_pairwise_images(img_composite, img_new,
             # --- Create Masks for Blending ---
             # Create mask for the warped image 1 using Alpha Channel
             if warped_img1_u8 is not None:
-                 # Check alpha channel (index 3)
-                 mask_warped = (warped_img1_u8[:, :, 3] > 0).astype(np.uint8) * 255
-                 # Erode the warped mask slightly to remove semi-transparent edge artifacts
-                 # This removes the 1-pixel border caused by linear interpolation blending with transparency.
-                 erosion_kernel = np.ones((3, 3), np.uint8)
-                 mask_warped = cv2.erode(mask_warped, erosion_kernel, iterations=3)
+                # Check alpha channel (index 3)
+                mask_warped = (warped_img1_u8[:, :, 3] > 0).astype(np.uint8) * 255
+                # Erode the warped mask slightly to remove semi-transparent edge artifacts
+                # This removes the 1-pixel border caused by linear interpolation blending with transparency.
+                erosion_kernel = np.ones((3, 3), np.uint8)
+                mask_warped = cv2.erode(mask_warped, erosion_kernel, iterations=3)
             else:
-                 mask_warped = np.zeros(output_img.shape[:2], dtype=np.uint8) # Empty mask if warp failed
+                mask_warped = np.zeros(output_img.shape[:2], dtype=np.uint8) # Empty mask if warp failed
 
             # Find overlapping region mask (uint8 0 or 255)
             overlap_mask = cv2.bitwise_and(mask_warped, mask_img2)
@@ -935,8 +936,14 @@ def stitch_pairwise_images(img_composite, img_new,
                         mean2 = np.sum(img2_roi[overlap_mask_gain > 0]) / overlap_pixel_count if img2_roi is not None else 0
 
                         if mean1 > 1e-5 and mean2 > 1e-5:
-                            gain = mean2 / mean1
-                            log_message = log_and_print(f"Calculated Gain: {gain:.2f}\n", log_message)
+                            if fixed_layer_type == "img1":
+                                # If the composite (Img1) is the base image, do not touch Img1, adjust Img2 instead
+                                # We need Img2's brightness to match Img1
+                                gain = mean1 / mean2
+                                log_message = log_and_print(f"Fixed Base (Img1): Adjusting Img2 brightness to match Base. Gain={gain:.2f}\n", log_message)
+                            else:
+                                gain = mean2 / mean1
+                                log_message = log_and_print(f"Calculated Gain: {gain:.2f}\n", log_message)
                             gain = np.clip(gain, 0.5, 2.0) # Clamp gain
                             log_message = log_and_print(f"Clamped Gain: {gain:.2f}\n", log_message)
                         else:
@@ -951,16 +958,26 @@ def stitch_pairwise_images(img_composite, img_new,
 
                     # Apply gain ONLY if calculated and different from 1.0
                     if abs(gain - 1.0) > 1e-5: # Check float difference
-                        gain_applied_float = warped_img1_u8.astype(np.float32)
-                        # Apply gain to RGB channels (0,1,2), Leave Alpha (3) untouched
-                        gain_applied_float[:, :, :3] *= gain
+                        if fixed_layer_type == "img1":
+                            # Directly modify the Img2 region in output_img (RGB channels only)
+                            # Note: output_img currently contains only Img2 pixels
+                            gain_applied_float = output_img.astype(np.float32)
+                            gain_applied_float[:, :, :3] *= gain
+
+                            output_img = np.clip(gain_applied_float, 0, 255).astype(np.uint8)
+                            gain_applied_warped_img1_u8 = warped_img1_u8
+                        else:
+                            gain_applied_float = warped_img1_u8.astype(np.float32)
+                            # Apply gain to RGB channels (0,1,2), Leave Alpha (3) untouched
+                            gain_applied_float[:, :, :3] *= gain
                         
-                        # *** Create new array for gain applied result ***
-                        temp_gain_applied = gain_applied_float.clip(0, 255).astype(np.uint8)
-                        # If gain_applied_warped_img1_u8 wasn't the original, delete it before reassigning
-                        if gain_applied_warped_img1_u8 is not warped_img1_u8:
-                            del gain_applied_warped_img1_u8
-                        gain_applied_warped_img1_u8 = temp_gain_applied # Assign the new gain-applied image
+                            # *** Create new array for gain applied result ***
+                            temp_gain_applied = gain_applied_float.clip(0, 255).astype(np.uint8)
+                            # If gain_applied_warped_img1_u8 wasn't the original, delete it before reassigning
+                            if gain_applied_warped_img1_u8 is not warped_img1_u8:
+                                del gain_applied_warped_img1_u8
+                            gain_applied_warped_img1_u8 = temp_gain_applied # Assign the new gain-applied image
+
                         del gain_applied_float, temp_gain_applied
                         gc.collect()
                         log_message = log_and_print(f"Gain applied to warped image (RGB channels).\n", log_message)
@@ -1027,6 +1044,14 @@ def stitch_pairwise_images(img_composite, img_new,
                         weights_overlap = d1_overlap / (total_dist + 1e-7) # Epsilon for stability
                         weight1_norm[overlap_indices] = np.clip(weights_overlap, 0.0, 1.0)
                         log_message = log_and_print(f"Calculated distance transform weights for {num_overlap_pixels} overlap pixels.\n", log_message)
+                        # If a base image is specified, we force the overlap area to fully show the "top" layer (weight 0 or 1)
+                        # This solves the "semi-transparent/ghosting" issue
+                        if fixed_layer_type == "img2": 
+                            # Img2 is Base, Img1 is Top -> Show Img1 (Weight 1.0)
+                            weight1_norm[overlap_indices] = 1.0
+                        elif fixed_layer_type == "img1":
+                            # Img1 is Base, Img2 is Top -> Show Img2 (Weight 0.0)
+                            weight1_norm[overlap_indices] = 0.0
                     else:
                         log_message = log_and_print("Warning: No overlap pixels found for distance transform weight calculation.\n", log_message)
                         
@@ -1191,11 +1216,10 @@ def stitch_pairwise_images(img_composite, img_new,
                         # Create weight maps (float32)
                         weight1 = np.zeros(output_img.shape[:2], dtype=np.float32)
                         weight2 = np.zeros(output_img.shape[:2], dtype=np.float32)
-                        blend_axis = 0 if w_overlap >= h_overlap else 1
-                        overlap_region_mask = overlap_mask[y_overlap : y_overlap + h_overlap, x_overlap : x_overlap + w_overlap]
 
                         # Generate gradient for the overlap box
                         gradient = None
+                        blend_axis = 0 if w_overlap >= h_overlap else 1
                         if blend_axis == 0: # Horizontal blend
                             gradient = np.tile(np.linspace(1.0, 0.0, w_overlap, dtype=np.float32), (h_overlap, 1))
                         else: # Vertical blend
@@ -1203,6 +1227,8 @@ def stitch_pairwise_images(img_composite, img_new,
 
                         weight1_region = gradient
                         weight2_region = 1.0 - gradient
+
+                        overlap_region_mask = overlap_mask[y_overlap : y_overlap + h_overlap, x_overlap : x_overlap + w_overlap]
 
                         # Apply weights only where the overlap mask is valid within the bounding box
                         valid_overlap = overlap_region_mask > 0
@@ -1353,7 +1379,17 @@ def stitch_pairwise_images(img_composite, img_new,
                     log_message = log_and_print(f"Blending method '{effective_blend_method}' or overlap condition not met. Performing simple overlay.\n", log_message)
 
                 if gain_applied_warped_img1_u8 is not None: # Only copy if we have something to copy
-                    output_img = cv2.copyTo(gain_applied_warped_img1_u8, mask_warped, output_img)
+                    # No blend or no overlap: Simple Overlay
+                    # Decide who covers whom based on Z-order
+                    # output_img already has Img2
+                    if fixed_layer_type == "img2":
+                         # Img2 is base, Img1 covers it
+                         output_img = cv2.copyTo(gain_applied_warped_img1_u8, mask_warped, output_img)
+                    else:
+                         # Img1 is base, Img2 covers it
+                         # output_img already has Img2, we just need to fill in where Img1 is not covered by Img2
+                         # Or place Img1 first, then Img2
+                         output_img = cv2.copyTo(output_img, mask_img2, gain_applied_warped_img1_u8)
 
             # --- Final Result Assignment ---
             final_output_img = output_img # Assign the final blended/overlaid image
@@ -1472,7 +1508,8 @@ def stitch_multiple_images(images, # List of NumPy images (BGR/BGRA, potentially
                                     max_blending_width=10000,
                                     max_blending_height=10000,
                                     blend_smooth_ksize=15,
-                                    num_blend_levels=4
+                                    num_blend_levels=4,
+                                    fixed_base_image_index=-1
                                     ):
     """
     Stitches a list of images. Tries cv2.Stitcher first (unless 'DIRECT_PAIRWISE'),
@@ -1681,6 +1718,20 @@ def stitch_multiple_images(images, # List of NumPy images (BGR/BGRA, potentially
                 else:
                     next_image = images[i] # Can use directly if already uint8
 
+                # Determine Fixed Layer Type for this pair
+                # fixed_layer_type logic:
+                # - "img2": The new image currently being added (index i) is the specified base map.
+                # - "img1": The current composite image (index < i) contains the specified base map.
+                # - "none": No base map specified, perform normal blending.
+                current_fixed_type = "none"
+                if fixed_base_image_index != -1:
+                    if i == fixed_base_image_index:
+                        current_fixed_type = "img2" # The new image being added IS the fixed base
+                    elif fixed_base_image_index < i:
+                        current_fixed_type = "img1" # The composite (img1) contains the fixed base, so it should stay at bottom
+                    elif fixed_base_image_index == 0:
+                        current_fixed_type = "img1" # Special case: First image is base, so composite is always base
+
                 result, pairwise_log = stitch_pairwise_images(
                     current_stitched_image,       # BGR uint8
                     next_image,                   # BGR uint8
@@ -1694,7 +1745,8 @@ def stitch_multiple_images(images, # List of NumPy images (BGR/BGRA, potentially
                     max_blending_width=max_blending_width,
                     max_blending_height=max_blending_height,
                     blend_smooth_ksize=blend_smooth_ksize,
-                    num_blend_levels=num_blend_levels
+                    num_blend_levels=num_blend_levels,
+                    fixed_layer_type=current_fixed_type
                 )
                 log += pairwise_log
 
@@ -1769,12 +1821,12 @@ def stitch_multiple_images(images, # List of NumPy images (BGR/BGRA, potentially
             return stitched_img_rgba, log
         except cv2.error as e_cvt:
             log = log_and_print(f"\nError converting final image: {e_cvt}. Returning None.\n", log)
-            if 'stitched_img_bgr' in locals(): del stitched_img_bgra
+            if 'stitched_img_bgra' in locals(): del stitched_img_bgra
             gc.collect()
             return None, log
     else:
         log = log_and_print("Error: Stitching failed. No final image generated.", log)
-        if 'stitched_img_bgr' in locals() and stitched_img_bgra is not None:
+        if 'stitched_img_bgra' in locals() and stitched_img_bgra is not None:
             del stitched_img_bgra
             gc.collect()
         return None, log
@@ -2051,7 +2103,7 @@ def stitch_video_frames(video_path,
                                         if last_saved_composite is not None:
                                             del last_saved_composite
                                         last_saved_composite = post_cropped_composite.copy() # Store BGR/BGRA
-                                        log = log_and_print(f"Saved composite image {len(stitched_results_rgb)} (Post-Cropped Shape: {post_cropped_composite.shape}).\n", log)
+                                        log = log_and_print(f"Saved composite image {len(stitched_results_rgba)} (Post-Cropped Shape: {post_cropped_composite.shape}).\n", log)
                                     else:
                                         log = log_and_print("Skipping save: Result identical to previously saved image.\n", log)
                                         
@@ -2113,9 +2165,9 @@ def stitch_video_frames(video_path,
                     # Clean up potentially lingering frame data from the failed iteration
                     if 'frame_bgr_raw' in locals() and frame_bgr_raw is not None:
                         del frame_bgr_raw
-                    if 'frame_bgr' in locals() and frame_bgra is not None:
+                    if 'frame_bgra' in locals() and frame_bgra is not None:
                         del frame_bgra
-                    if 'cropped_frame_bgr' in locals() and cropped_frame_bgra is not None:
+                    if 'cropped_frame_bgra' in locals() and cropped_frame_bgra is not None:
                         del cropped_frame_bgra
                     if 'current_frame_for_stitch' in locals() and current_frame_for_stitch is not None and current_frame_for_stitch is not anchor_frame:
                         del current_frame_for_stitch
@@ -2145,7 +2197,11 @@ def stitch_video_frames(video_path,
                          is_duplicate = True
                  if not is_duplicate:
                      append_result(post_cropped_final) # RGBA append
-                     log = log_and_print(f"Saved final composite image {len(stitched_results_rgba)} (Post-Cropped Shape: {post_cropped_composite.shape}).\n", log)
+                     message = f"Saved final composite image {len(stitched_results_rgba)}"
+                     if 'post_cropped_composite' in locals():
+                        message += f" (Post-Cropped Shape: {post_cropped_composite.shape})"
+                         
+                     log = log_and_print(f"{message}.\n", log)
                      # No need to update last_saved_composite here, loop is finished
                  else:
                      log = log_and_print("Skipping save of final composite: Result identical to previously saved image.\n", log)
@@ -2174,15 +2230,15 @@ def stitch_video_frames(video_path,
     gc.collect()
 
     total_end_time = time.time()
-    log = log_and_print(f"\nVideo stitching process finished. Found {len(stitched_results_rgb)} stitched image(s).", log)
+    log = log_and_print(f"\nVideo stitching process finished. Found {len(stitched_results_rgba)} stitched image(s).", log)
     log = log_and_print(f"\nTotal processing time: {total_end_time - total_start_time:.2f} seconds.\n", log)
 
     # Filter out potential None entries just before returning
-    final_results = [img for img in stitched_results_rgb if img is not None and img.size > 0]
-    if len(final_results) != len(stitched_results_rgb):
-        log = log_and_print(f"Warning: Filtered out {len(stitched_results_rgb) - len(final_results)} None or empty results before final return.\n", log)
+    final_results = [img for img in stitched_results_rgba if img is not None and img.size > 0]
+    if len(final_results) != len(stitched_results_rgba):
+        log = log_and_print(f"Warning: Filtered out {len(stitched_results_rgba) - len(final_results)} None or empty results before final return.\n", log)
         # Clean up the original list with potential Nones
-        del stitched_results_rgb
+        del stitched_results_rgba
         gc.collect()
 
     return final_results, log
@@ -2200,6 +2256,7 @@ def run_stitching_interface(input_files,
     exposure_comp_type_str, # For cv2.Stitcher
     enable_cropping, # Post-stitch black border crop
     strict_no_black_edges_input,
+    fixed_base_image_index_input,
     # Detailed Stitcher Settings
     transform_model_str,
     blend_method_str,
@@ -2230,10 +2287,11 @@ def run_stitching_interface(input_files,
         return [], "Please upload images or a video file."
     
     # Convert Gradio inputs to correct types
-    blend_smooth_ksize = int(blend_smooth_ksize_input) if blend_smooth_ksize_input is not None else -1
-    num_blend_levels = int(num_blend_levels_input) if num_blend_levels_input is not None else 4
+    fixed_base_image_index = int(fixed_base_image_index_input) if fixed_base_image_index_input is not None else -1
     ransac_reproj_thresh = float(ransac_reproj_thresh_input) if ransac_reproj_thresh_input is not None else 3.0
     max_distance_coeff = float(max_distance_coeff_input) if max_distance_coeff_input is not None else 0.5
+    blend_smooth_ksize = int(blend_smooth_ksize_input) if blend_smooth_ksize_input is not None else -1
+    num_blend_levels = int(num_blend_levels_input) if num_blend_levels_input is not None else 4
 
     log = f"Received {len(input_files)} file(s).\n"
     log = log_and_print(f"Pre-Crop Settings: Top={crop_top_percent}%, Bottom={crop_bottom_percent}%\n", log)
@@ -2457,7 +2515,7 @@ def run_stitching_interface(input_files,
             blend_method_lower = blend_method_str.lower() if blend_method_str else "multi-band"
 
             # Call the modified stitch_multiple_images function
-        stitched_single_rgb, stitch_log_img = stitch_multiple_images(
+        stitched_single_rgba, stitch_log_img = stitch_multiple_images(
             images_bgr_cropped, # Pass the list of cropped images (BGRA)
             stitcher_mode_str=stitcher_mode_str,
             registration_resol=registration_resol,
@@ -2477,11 +2535,12 @@ def run_stitching_interface(input_files,
             max_blending_width=max_blending_width,
             max_blending_height=max_blending_height,
             blend_smooth_ksize=blend_smooth_ksize,
-            num_blend_levels=num_blend_levels
+            num_blend_levels=num_blend_levels,
+            fixed_base_image_index=fixed_base_image_index
         )
         stitch_log += stitch_log_img # Append log from stitching function
-        if stitched_single_rgb is not None:
-            final_stitched_images_rgba = [stitched_single_rgb] # Result is a list containing the single image
+        if stitched_single_rgba is not None:
+            final_stitched_images_rgba = [stitched_single_rgba] # Result is a list containing the single image
 
         # Clean up loaded images for list mode after stitching attempt
         if 'images_bgr_cropped' in locals():
@@ -2529,24 +2588,45 @@ def run_stitching_interface(input_files,
             temp_dir = tempfile.mkdtemp(prefix="stitch_run_", dir=target_temp_dir_base)
             final_log = log_and_print(f"\nInfo: Saving output images to temporary directory: {temp_dir}\n", final_log)
 
-            for i, img_rgb in enumerate(final_stitched_images_rgba):
-                if img_rgb is None or img_rgb.size == 0:
+            for i, img_rgba in enumerate(final_stitched_images_rgba):
+                if img_rgba is None or img_rgba.size == 0:
                     final_log = log_and_print(f"Warning: Skipping saving image index {i} because it is None or empty.\n", final_log)
                     continue
-                filename = f"stitched_image_{i+1:03d}.png" # PNG is required for transparency
+
+                # Default filename
+                filename = f"stitched_{i+1:03d}.png" # PNG is required for transparency
+
+                # If in multi-image mode (not video mode), and input paths exist
+                if not is_video_input and image_paths:
+                    try:
+                        # Get the path of the last image
+                        last_image_path = image_paths[-1]
+                        # Get the filename and remove the extension (e.g., "filename.jpg" -> "filename")
+                        last_image_name = os.path.splitext(os.path.basename(last_image_path))[0]
+                        
+                        if len(final_stitched_images_rgba) > 1:
+                            # In case multiple results are produced, add numbering to avoid overwriting
+                            filename = f"{last_image_name}_stitched_{i+1:03d}.png"
+                        else:
+                            # Normal single result, use requested format: [last_image_filename]_stitched.png
+                            filename = f"{last_image_name}_stitched.png"
+                    except Exception as e_name:
+                        # If an error occurs, keep the default filename
+                        pass
+
                 # Use os.path.join for cross-platform compatibility
                 full_path = os.path.join(temp_dir, filename)
-                img_bgr = None # Initialize for finally block
+                img_bgra = None # Initialize for finally block
                 try:
                     # Handle RGBA to BGRA for saving
                     # The result coming from stitcher is in RGB(A) format
-                    if img_rgb.shape[2] == 4:
-                        img_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGBA2BGRA)
+                    if img_rgba.shape[2] == 4:
+                        img_bgra = cv2.cvtColor(img_rgba, cv2.COLOR_RGBA2BGRA)
                     else:
-                        img_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
+                        img_bgra = cv2.cvtColor(img_rgba, cv2.COLOR_RGB2BGR)
                 
                     # Use imencode -> write pattern for better handling of paths/special chars
-                    is_success, buf = cv2.imencode('.png', img_bgr)
+                    is_success, buf = cv2.imencode('.png', img_bgra)
                     if is_success:
                         with open(full_path, 'wb') as f:
                             f.write(buf)
@@ -2562,15 +2642,15 @@ def run_stitching_interface(input_files,
                 except Exception as e_write:
                     final_log = log_and_print(f"Unexpected error writing image {filename} to {full_path}: {e_write}\n", final_log)
                 finally:
-                    if img_bgr is not None:
-                        del img_bgr
+                    if img_bgra is not None:
+                        del img_bgra
                     gc.collect()
         except Exception as e_tempdir:
             final_log = log_and_print(f"Error creating temporary directory or saving output: {e_tempdir}\n", final_log)
             output_file_paths = [] # Fallback to empty list
             
     # --- Final Cleanup of RGB images list ---
-    if 'final_stitched_images_rgb' in locals():
+    if 'final_stitched_images_rgba' in locals():
         for img_del in final_stitched_images_rgba:
             if img_del is not None:
                 del img_del
@@ -2632,42 +2712,44 @@ with gr.Blocks() as demo:
 
             # --- Detailed Stitcher Settings (Used for Video, DIRECT_PAIRWISE, and Fallback) ---
             with gr.Accordion("Pairwise Stitching Settings (Video / Direct / Fallback)", open=True):
+                fixed_base_image_index_input = gr.Number(value=-1, label="Fixed Base Image Index (0-based)", precision=0,
+                                info="Specify the index of the image (0, 1, 2...) that should serve as the 'Bottom/Base' layer without blending. Overlapping images will cover it, but brightness will still adjust. Set -1 to disable.")
                 transform_model = gr.Radio(["Homography", "Affine_Partial", "Affine_Full"], label="Pairwise Transform Model", value="Homography", # Default to Homography
-                                                                     info="Geometric model for pairwise alignment. 'Homography' handles perspective. 'Affine' (Partial/Full) handles translation, rotation, scale, shear (better for scans, less distortion risk). If stitching fails with one model, try another.")
+                                info="Geometric model for pairwise alignment. 'Homography' handles perspective. 'Affine' (Partial/Full) handles translation, rotation, scale, shear (better for scans, less distortion risk). If stitching fails with one model, try another.")
                 blend_method = gr.Radio(["Linear", "Multi-Band"], label="Blending Method", value="Multi-Band",
-                                                                info="Algorithm for smoothing seams in overlapping regions when using the detailed stitcher (for video or image list fallback). 'Multi-Band' is often better but slower.")
+                                info="Algorithm for smoothing seams in overlapping regions when using the detailed stitcher (for video or image list fallback). 'Multi-Band' is often better but slower.")
                 enable_gain_compensation = gr.Checkbox(value=True, label="Enable Gain Compensation",
-                                                                                                info="Adjusts overall brightness difference *before* blending when using the detailed stitcher. Recommended.")
+                                info="Adjusts overall brightness difference *before* blending when using the detailed stitcher. Recommended.")
                 orb_nfeatures = gr.Slider(500, 10000, step=100, value=2000, label="ORB Features",
-                                                                     info="Maximum ORB keypoints detected per image/frame. Used by the detailed stitcher (for video or image list fallback).")
+                                info="Maximum ORB keypoints detected per image/frame. Used by the detailed stitcher (for video or image list fallback).")
                 match_ratio_thresh = gr.Slider(0.5, 0.95, step=0.01, value=0.75, label="Match Ratio Threshold",
-                                                                             info="Lowe's ratio test threshold for filtering feature matches (lower = stricter). Used by the detailed stitcher (for video or image list fallback).")
+                                info="Lowe's ratio test threshold for filtering feature matches (lower = stricter). Used by the detailed stitcher (for video or image list fallback).")
                 ransac_reproj_thresh = gr.Slider(1.0, 10.0, step=0.1, value=5.0, label="RANSAC Reproj Threshold",
-                                                                                info="Maximum reprojection error (pixels) allowed for a match to be considered an inlier by RANSAC during transformation estimation. Lower values are stricter.")
+                                info="Maximum reprojection error (pixels) allowed for a match to be considered an inlier by RANSAC during transformation estimation. Lower values are stricter.")
                 max_distance_coeff = gr.Slider(0.1, 2.0, step=0.05, value=0.5, label="Max Distance Coeff",
-                                                                             info="Multiplier for image diagonal used to filter initial matches. Limits the pixel distance between matched keypoints (0.5 means half the diagonal).")
+                                info="Multiplier for image diagonal used to filter initial matches. Limits the pixel distance between matched keypoints (0.5 means half the diagonal).")
                 max_blending_width = gr.Number(value=10000, label="Max Blending Width", precision=0,
-                                                                             info="Limits the canvas width during the detailed pairwise blending step to prevent excessive memory usage. Relevant for the detailed stitcher.")
+                                info="Limits the canvas width during the detailed pairwise blending step to prevent excessive memory usage. Relevant for the detailed stitcher.")
                 max_blending_height = gr.Number(value=10000, label="Max Blending Height", precision=0,
-                                                                                info="Limits the canvas height during the detailed pairwise blending step to prevent excessive memory usage. Relevant for the detailed stitcher.")
+                                info="Limits the canvas height during the detailed pairwise blending step to prevent excessive memory usage. Relevant for the detailed stitcher.")
                 blend_smooth_ksize = gr.Number(value=15, label="Blend Smooth Kernel Size", precision=0,
-                                                                             info="Size of Gaussian kernel to smooth blend mask/weights. Must be POSITIVE ODD integer to enable smoothing (e.g., 5, 15, 21). Set to -1 or an even number to disable smoothing.")
+                                info="Size of Gaussian kernel to smooth blend mask/weights. Must be POSITIVE ODD integer to enable smoothing (e.g., 5, 15, 21). Set to -1 or an even number to disable smoothing.")
                 num_blend_levels = gr.Slider(2, 7, step=1, value=4, label="Multi-Band Blend Levels",
-                                                                         info="Number of pyramid levels for Multi-Band blending. Fewer levels are faster but might have less smooth transitions.")
+                                info="Number of pyramid levels for Multi-Band blending. Fewer levels are faster but might have less smooth transitions.")
 
             with gr.Accordion("Video Stitcher Settings", open=False):
                 sample_interval_ms = gr.Number(value=3000, label="Sample Interval (ms)", precision=0,
-                                                                             info="Time interval (in milliseconds) between sampled frames for video stitching. Smaller values sample more frames, increasing processing time but potentially improving tracking.")
+                                info="Time interval (in milliseconds) between sampled frames for video stitching. Smaller values sample more frames, increasing processing time but potentially improving tracking.")
                 max_composite_width_video = gr.Number(value=10000, label="Max Composite Width (Video)", precision=0,
-                                                                                         info="Limits the width of the stitched output during video processing. If exceeded, the current result is saved and stitching restarts with the next frame. 0 = no limit.")
+                                info="Limits the width of the stitched output during video processing. If exceeded, the current result is saved and stitching restarts with the next frame. 0 = no limit.")
                 max_composite_height_video = gr.Number(value=10000, label="Max Composite Height (Video)", precision=0,
-                                                                                            info="Limits the height of the stitched output during video processing. If exceeded, the current result is saved and stitching restarts with the next frame. 0 = no limit.")
+                                info="Limits the height of the stitched output during video processing. If exceeded, the current result is saved and stitching restarts with the next frame. 0 = no limit.")
 
             with gr.Accordion("Postprocessing Settings", open=False):
                 enable_cropping = gr.Checkbox(value=True, label="Crop Black Borders (Post-Stitch)",
-                                                                            info="Automatically remove black border areas from the final stitched image(s) AFTER stitching.")
+                                info="Automatically remove black border areas from the final stitched image(s) AFTER stitching.")
                 strict_no_black_edges_checkbox = gr.Checkbox(value=False, label="Strict No Black Edges (Post-Crop)",
-                    info="If 'Crop Black Borders' is enabled, this forces removal of *any* remaining black pixels directly on the image edges after the main crop. Might slightly shrink the image further.")
+                                info="If 'Crop Black Borders' is enabled, this forces removal of *any* remaining black pixels directly on the image edges after the main crop. Might slightly shrink the image further.")
 
         with gr.Column(scale=1):
             output_gallery = gr.Gallery(
@@ -2692,6 +2774,7 @@ with gr.Blocks() as demo:
                 # Postprocessing
                 enable_cropping,
                 strict_no_black_edges_checkbox,
+                fixed_base_image_index_input,
                 # Detailed Stitcher Settings
                 transform_model,
                 blend_method,
@@ -2716,7 +2799,7 @@ with gr.Blocks() as demo:
             ["examples/Wetter-Panorama/Wetter-Panorama1[NIuO6hrFTrg].mp4"],
             0, 20,
             "DIRECT_PAIRWISE", 0.6, 0.1, -1, False, "GAIN_BLOCKS",
-            True, False,
+            True, False, -1,
             "Homography", "Multi-Band", True, 5000, 0.5, 5.0, 0.5, 10000, 10000, 15, 4,
             2500, 10000, 10000,
         ],
@@ -2724,7 +2807,7 @@ with gr.Blocks() as demo:
             ["examples/Wetter-Panorama/Wetter-Panorama2[NIuO6hrFTrg].mp4"],
             0, 20,
             "DIRECT_PAIRWISE", 0.6, 0.1, -1, False, "GAIN_BLOCKS",
-            True, False,
+            True, False, -1,
             "Homography", "Multi-Band", True, 5000, 0.5, 5.0, 0.5, 10000, 10000, 15, 4,
             2500, 10000, 10000,
         ],
@@ -2733,7 +2816,7 @@ with gr.Blocks() as demo:
              "examples/NieRAutomata/nier2B_06.jpg", "examples/NieRAutomata/nier2B_07.jpg", "examples/NieRAutomata/nier2B_08.jpg", "examples/NieRAutomata/nier2B_09.jpg", "examples/NieRAutomata/nier2B_10.jpg", ],
             0, 0,
             "PANORAMA", 0.6, 0.1, -1, False, "GAIN_BLOCKS",
-            True, False,
+            True, False, -1,
             "Homography", "Multi-Band", True, 5000, 0.5, 5.0, 0.5, 10000, 10000, 15, 4,
             5000, 10000, 10000,
         ],
@@ -2741,7 +2824,7 @@ with gr.Blocks() as demo:
             ["examples/cat/cat_left.jpg", "examples/cat/cat_right.jpg"],
             0, 0,
             "SCANS", 0.6, 0.1, -1, False, "GAIN_BLOCKS",
-            True, False,
+            True, False, -1,
             "Affine_Partial", "Linear", True, 5000, 0.5, 5.0, 0.5, 10000, 10000, 15, 4,
             5000, 10000, 10000,
         ],
@@ -2749,7 +2832,7 @@ with gr.Blocks() as demo:
             ["examples/ギルドの受付嬢ですが/Girumasu_1.jpg", "examples/ギルドの受付嬢ですが/Girumasu_2.jpg", "examples/ギルドの受付嬢ですが/Girumasu_3.jpg"],
             0, 0,
             "PANORAMA", 0.6, 0.1, -1, False, "GAIN_BLOCKS",
-            True, False,
+            True, False, -1,
             "Affine_Partial", "Linear", True, 5000, 0.65, 5.0, 0.5, 10000, 10000, 15, 4,
             5000, 10000, 10000,
         ],
@@ -2757,7 +2840,7 @@ with gr.Blocks() as demo:
             ["examples/photographs1/img1.jpg", "examples/photographs1/img2.jpg", "examples/photographs1/img3.jpg", "examples/photographs1/img4.jpg"],
             0, 0,
             "PANORAMA", 0.6, 0.1, -1, True, "GAIN_BLOCKS",
-            True, False,
+            True, False, -1,
             "Homography", "Linear", True, 5000, 0.5, 5.0, 0.5, 10000, 10000, 15, 4,
             5000, 10000, 10000,
         ]
