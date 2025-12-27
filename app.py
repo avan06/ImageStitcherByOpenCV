@@ -2283,6 +2283,76 @@ def stitch_video_frames(video_path,
     return final_results, log
 
 
+# Custom CSS for Gallery
+css = """
+/* Add hover effect to Gallery to indicate it is an interactive area */
+#input_gallery:hover {
+    border-color: var(--color-accent) !important;
+    box-shadow: 0 0 10px rgba(0,0,0,0.1);
+}
+"""
+
+# JavaScript to handle Ctrl+V paste for MULTIPLE files (Images OR Videos) when hovering over the gallery
+paste_js = """
+function initPaste() {
+    document.addEventListener('paste', function(e) {
+        // 1. First find the Gallery component
+        const gallery = document.getElementById('input_gallery');
+        if (!gallery) return;
+    
+        // 2. Check if mouse is hovering over the Gallery
+        // If mouse is not over the gallery, ignore this paste event
+        if (!gallery.matches(':hover')) {
+            return;
+        }
+
+        const clipboardData = e.clipboardData || e.originalEvent.clipboardData;
+        if (!clipboardData) return;
+
+        const items = clipboardData.items;
+        const files = [];
+
+        // 3. Check clipboard content for images OR videos
+        for (let i = 0; i < items.length; i++) {
+            if (items[i].kind === 'file') {
+                if (items[i].type.startsWith('image/') || items[i].type.startsWith('video/')) {
+                    files.push(items[i].getAsFile());
+                }
+            }
+        }
+    
+        // 4. Check file list (Copied files from OS)
+        if (files.length === 0 && clipboardData.files.length > 0) {
+             for (let i = 0; i < clipboardData.files.length; i++) {
+                if (clipboardData.files[i].type.startsWith('image/') || clipboardData.files[i].type.startsWith('video/')) {
+                    files.push(clipboardData.files[i]);
+                }
+            }
+        }
+
+        if (files.length === 0) return;
+    
+        // 5. Execute upload logic
+        // Find input inside the gallery component
+        const uploadInput = gallery.querySelector('input[type="file"]');
+    
+        if (uploadInput) {
+            e.preventDefault();
+            e.stopPropagation();
+
+            const dataTransfer = new DataTransfer();
+            files.forEach(file => dataTransfer.items.add(file));
+        
+            uploadInput.files = dataTransfer.files;
+
+            // Trigger Gradio update
+            uploadInput.dispatchEvent(new Event('change', { bubbles: true }));
+        }
+    });
+}
+"""
+
+
 # --- Gradio Interface Function ---
 def run_stitching_interface(input_files,
     use_transparency,
@@ -2317,15 +2387,14 @@ def run_stitching_interface(input_files,
     ):
     """
     Wrapper function called by the Gradio interface.
-    Handles input (images or video), applies pre-cropping,
-    calls the appropriate stitching logic (passing transform_model_str),
-    and returns results.
+    Handles input (images or video) from Gallery (tuples of path/caption), applies pre-cropping,
+    calls the appropriate stitching logic (passing transform_model_str), and returns results.
     Updates image reading and result saving to handle RGBA/BGRA transparency.
     UPDATED to handle transparency correctly when saving to temp files.
     """
     if input_files is None or len(input_files) == 0:
         return [], "Please upload images or a video file."
-    
+
     # Convert Gradio inputs to correct types
     fixed_base_image_index = int(fixed_base_image_index_input) if fixed_base_image_index_input is not None else -1
     ransac_reproj_thresh = float(ransac_reproj_thresh_input) if ransac_reproj_thresh_input is not None else 3.0
@@ -2333,7 +2402,7 @@ def run_stitching_interface(input_files,
     blend_smooth_ksize = int(blend_smooth_ksize_input) if blend_smooth_ksize_input is not None else -1
     num_blend_levels = int(num_blend_levels_input) if num_blend_levels_input is not None else 4
 
-    log = f"Received {len(input_files)} file(s).\n"
+    log = f"Received {len(input_files)} item(s) from gallery.\n"
     log = log_and_print(f"Pre-Crop Settings: Top={crop_top_percent}%, Bottom={crop_bottom_percent}%\n", log)
     log = log_and_print(f"Post-Crop Black Borders: Enabled={enable_cropping}, Strict Edges={strict_no_black_edges_input}\n", log)
     # Log detailed settings including new ones
@@ -2350,13 +2419,29 @@ def run_stitching_interface(input_files,
     try:
         # Handle potential TempfileWrappers or string paths
         input_filepaths = []
-        for f in input_files:
-            if hasattr(f, 'name'): # Gradio File object
-                input_filepaths.append(f.name)
-            elif isinstance(f, str): # String path (e.g., from examples)
-                input_filepaths.append(f)
+        for item in input_files:
+            # Gallery input typically comes as a list of tuples: (filepath, caption)
+            # We need to extract the filepath.
+            extracted_path = None
+            
+            if isinstance(item, (tuple, list)):
+                # Item is (path, caption)
+                potential_file = item[0]
+                if isinstance(potential_file, str):
+                    extracted_path = potential_file
+                elif hasattr(potential_file, 'name'): # Handle file-like object if present
+                    extracted_path = potential_file.name
+                elif isinstance(potential_file, dict) and 'name' in potential_file: # Handle dictionary format
+                    extracted_path = potential_file['name']
+            elif hasattr(item, 'name'): # Fallback for direct File objects
+                extracted_path = item.name
+            elif isinstance(item, str): # Fallback for direct strings
+                extracted_path = item
+
+            if extracted_path:
+                input_filepaths.append(extracted_path)
             else:
-                 log = log_and_print(f"Warning: Unexpected input file type: {type(f)}. Skipping.\n", log)
+                log = log_and_print(f"Warning: Could not extract path from gallery item: {item}. Skipping.\n", log)
 
         if len(input_filepaths) == 1:
             filepath = input_filepaths[0]
@@ -2696,8 +2781,8 @@ def run_stitching_interface(input_files,
                     # Use imencode -> write pattern for better handling of paths/special chars
                     is_success, buf = cv2.imencode('.png', img_bgra)
                     if is_success:
-                        with open(full_path, 'wb') as f:
-                            f.write(buf)
+                        with open(full_path, 'wb') as item:
+                            item.write(buf)
                         # Use Gradio File obj or just path string? Gallery seems to prefer path strings.
                         output_file_paths.append((full_path, filename)) # Store the full path for Gradio Gallery
                         # final_log = log_and_print(f"Successfully saved: {filename}\n", final_log) # Can be verbose
@@ -2732,7 +2817,7 @@ def run_stitching_interface(input_files,
     return output_file_paths, final_log
 
 # --- Define Gradio Interface ---
-with gr.Blocks() as demo:
+with gr.Blocks(css=css) as demo:
     gr.Markdown("# OpenCV Image and Video Stitcher")
     gr.Markdown(
         "Upload multiple images (for list/panorama stitching) OR a single video file (for sequential frame stitching). "
@@ -2743,12 +2828,23 @@ with gr.Blocks() as demo:
     with gr.Row():
         with gr.Column(scale=1):
             stitch_button = gr.Button("Stitch", variant="primary")
-            input_files = gr.File(
-                label="Upload Images or a Video",
-                # Common image and video types
-                file_types=["image", ".mp4", ".avi", ".mov", ".mkv", ".wmv", ".webm"],
-                file_count="multiple",
-                elem_id="input_files"
+            # File Input with Gallery Input
+            input_files = gr.Gallery(
+                columns=5, 
+                rows=3, 
+                show_share_button=False, 
+                interactive=True, 
+                height=300, 
+                label="Input Gallery (Drag multiple images/video here)",
+                elem_id="input_gallery", # Crucial for the paste_js to work
+                # Note: file_types is handled by the JS paste logic for clipboard
+            )
+            gr.Markdown(
+                """
+                <div style="text-align: right; font-size: 0.9em; color: gray;">
+                💡 Tip: Hover over the gallery and press <b>Ctrl+V</b> to paste images or video.
+                </div>
+                """
             )
 
             # --- Parameters Grouping ---
@@ -2916,7 +3012,11 @@ with gr.Blocks() as demo:
             5000, 10000, 10000,
         ]
     ]
-    gr.Examples(examples, inputs=inputs, label="Example Configurations")
+    gr.Examples(
+        examples,
+        inputs=inputs,
+        label="Example Configurations",
+     )
 
     # Connect button click to the function
     stitch_button.click(
@@ -2924,6 +3024,9 @@ with gr.Blocks() as demo:
         inputs=inputs,
         outputs=[output_gallery, output_log]
     )
+    
+    # Load the JavaScript for Ctrl+V support
+    demo.load(None, None, None, js=paste_js)
 
 # --- Main Execution Block ---
 if __name__ == "__main__":
